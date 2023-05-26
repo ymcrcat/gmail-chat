@@ -18,14 +18,14 @@ import tiktoken
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import Pinecone
 from langchain.chat_models import ChatOpenAI
-from langchain.chains.conversation.memory import ConversationBufferMemory
+from langchain.chains.conversation.memory import ConversationBufferWindowMemory
 from langchain.chains import RetrievalQA
 from langchain.agents import Tool, initialize_agent
 
 
 MODEL_NAME = "text-embedding-ada-002" # Name of the model used to generate text embeddings
 # MAX_TOKENS = 8191 # Maximum number of tokens allowed by the model
-MAX_TOKENS = 3000 # stay below the 4097 token limit for GPT-3
+MAX_TOKENS = 1500 # stay below the 4096 token limit for GPT-3
 INDEX_NAME = "email-index"
 TEXT_EMBEDDINGS_DIM = 1536 # Dimension of text embeddings
 METRIC = "cosine"
@@ -105,7 +105,10 @@ def parse_date(date_string):
 
 # Function to decode the message part
 def decode_part(part):
-    data = part['body']['data']
+    if 'body' in part.keys():
+        data = part['body']['data']
+    else:
+        return None
     data = data.replace('-', '+').replace('_', '/')
     decoded_bytes = base64.urlsafe_b64decode(data)
     return decoded_bytes.decode('utf-8')
@@ -117,7 +120,7 @@ def find_part(parts, mime_type):
             return part
     return None
 
-message_count = 0
+message_count = 0 # Global variable to keep track of number of messages processed
 
 def index_gmail():
     pinecone_index = pinecone_setup()
@@ -158,37 +161,41 @@ def index_gmail():
                 if not data:
                     raise ValueError(f"Could not find body in message {msg['id']}")
         
-                content = f"From: {from_name}\n" \
+                chunk_prefix = f"From: {from_name}\n" \
                   f"To: {to_name}\n" \
                   f"Date: {datetime_object}\n" \
-                  f"Subject: {subject}\n" \
-                  f"{data}"
+                  f"Subject: {subject}\n"
                 
                 # Embed email data an add to Pinecone index
-                chunks = chunk_text(content)
+                chunks = [f'{chunk_prefix}{chunk}' for chunk in chunk_text(data)]
                 embeds = embed.embed_documents(chunks)
                 ids = [msg['id'] + '-' + str(i) for i in range(len(chunks))]
                 pinecone_index.upsert(vectors=zip(ids, embeds, [{'id': msg['id'], 'text': chunks[i]} for i in range(len(chunks))]))
 
-            except BadRequest as e:
-                print(f"\nError while adding email {msg['id']} to Pinecone: {e}")
-            except ValueError as e:
-                print(f"\nError while adding email {msg['id']} to Pinecone: {e}")
-            finally:
                 message_count += 1
 
+            except Exception as e:
+                print(f"\nError while adding email {msg['id']} to Pinecone: {e}")
+
         # Define a function to get all messages recursively
-        def get_all_emails(gmail, query, page_token=None):
-            try:
-                result = gmail.users().messages().list(q=query, userId='me', pageToken=page_token).execute()
-                messages = result.get('messages', [])
-                next_page = result.get('nextPageToken', None)
-                if next_page:
-                    messages.extend(get_all_emails(gmail, query, next_page))
-                return messages
-            except HttpError as error:
-                print(f"An error occurred: {error}")
-                return []
+        def get_all_emails(gmail, query):
+            messages = []
+            page_token=None
+            
+            while True:
+                try:
+                    result = gmail.users().messages().list(q=query, 
+                                                        userId='me', 
+                                                        maxResults=500, 
+                                                        pageToken=page_token).execute()
+                    messages.extend( result.get('messages', []) )
+                    page_token = result.get('nextPageToken', None)
+                    if not page_token:
+                        break
+                except HttpError as error:
+                    print(f"An error occurred: {error}")
+                    break
+            return messages
 
         gmail = build('gmail', 'v1', credentials=creds)
         # A query to retrieve all emails, including archived ones
@@ -229,7 +236,7 @@ def ask(query):
                      temperature=0.0)
 
     # Answer question using LLM and email content
-    text_field = "text"
+    text_field = "text" 
     vectorstore = Pinecone(pinecone_index, embed.embed_query, text_field)    
     qa = RetrievalQA.from_chain_type(llm=llm, 
                                      chain_type="stuff",
@@ -247,8 +254,9 @@ def chat():
     llm = ChatOpenAI(openai_api_key=openai_api_key, 
                      model_name=GPT_MODEL,
                      temperature=0.0)
-    conversational_memory = ConversationBufferMemory(
+    conversational_memory = ConversationBufferWindowMemory(
         memory_key='chat_history',
+        k = 10,
         return_messages=True)
     text_field = "text"
     vectorstore = Pinecone(pinecone_index, embed.embed_query, text_field)
@@ -296,22 +304,27 @@ def chat():
 
     InteractiveShell().cmdloop()
 
+def usage():
+    sys.exit('Usage: gmail_chat index | ask <query> | chat | create | delete')
+
 def main():
     if len(sys.argv) < 2:
-        sys.exit('Usage: gmail_chat index | search')
+        usage()
 
     if sys.argv[1] == 'create':
         create_index()
-    if sys.argv[1] == 'index':
+    elif sys.argv[1] == 'index':
         index_gmail()
-    if sys.argv[1] == 'delete':
+    elif sys.argv[1] == 'delete':
         delete_index()
     elif sys.argv[1] == 'ask':
         if len(sys.argv) < 3:
-            sys.exit('Usage: gmail_chat ask <query>')
+            usage()
         ask(sys.argv[2])
     elif sys.argv[1] == 'chat':
         chat()
+    else:
+        usage()
 
 if __name__ == '__main__':
     main()
