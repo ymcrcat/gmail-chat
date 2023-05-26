@@ -3,6 +3,7 @@ import os
 import os.path
 import base64
 import pickle
+import cmd
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -12,11 +13,12 @@ from langchain.embeddings.openai import OpenAIEmbeddings
 import pinecone
 from tqdm import tqdm
 import tiktoken
-from langchain.text_splitter import CharacterTextSplitter, RecursiveCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import Pinecone
 from langchain.chat_models import ChatOpenAI
-from langchain.chains.conversation.memory import ConversationBufferWindowMemory
+from langchain.chains.conversation.memory import ConversationBufferMemory
 from langchain.chains import RetrievalQA
+from langchain.agents import Tool, initialize_agent
 
 
 MODEL_NAME = "text-embedding-ada-002" # Name of the model used to generate text embeddings
@@ -34,7 +36,7 @@ def chunk_text(text):
     # Initialize the text splitter
     # text_splitter = CharacterTextSplitter.from_tiktoken_encoder(tokenizer.name)
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=MAX_TOKENS,
-                                                   chunk_overlap=0)
+                                                   chunk_overlap=100)
 
     # Split the tokens into chunks of 8191 tokens
     chunks = text_splitter.split_text(text)
@@ -191,25 +193,76 @@ def ask(query):
     llm = ChatOpenAI(openai_api_key=openai_api_key, 
                      model_name=GPT_MODEL,
                      temperature=0.0)
-    conversational_memory = ConversationBufferWindowMemory(
-        memory_key='chat_history',
-        k = 5,
-        return_messages=True)
 
+    # Find relevant emails
     # embed_query = embed.embed_documents(chunk_text(query))
     # response = pinecone_index.query(queries=embed_query, top_k=3)
     # print (response)
 
+    # Answer question using LLM and email content
     text_field = "text"
-    vectorstore = Pinecone(pinecone_index, embed.embed_query, text_field)
-    # results = vectorstore.similarity_search(query, k=5)
-    # print(results)
-    
+    vectorstore = Pinecone(pinecone_index, embed.embed_query, text_field)    
     qa = RetrievalQA.from_chain_type(llm=llm, 
-                                     chain_type="refine",
+                                     chain_type="stuff",
                                      retriever=vectorstore.as_retriever())
     result = qa.run(query)
     print(f'\n{result}')
+
+def chat():
+    openai_api_key=os.getenv('OPENAI_API_KEY')
+    if openai_api_key is None:
+        raise ValueError("OPENAI_API_KEY environment variable is not set")
+    pinecone_index = pinecone_setup()
+
+    embed = OpenAIEmbeddings(model=MODEL_NAME, openai_api_key=openai_api_key)
+    llm = ChatOpenAI(openai_api_key=openai_api_key, 
+                     model_name=GPT_MODEL,
+                     temperature=0.0)
+    conversational_memory = ConversationBufferMemory(
+        memory_key='chat_history',
+        return_messages=True)
+    text_field = "text"
+    vectorstore = Pinecone(pinecone_index, embed.embed_query, text_field)
+    qa = RetrievalQA.from_chain_type(llm=llm, 
+                                     chain_type="stuff",
+                                     retriever=vectorstore.as_retriever())
+
+    tools = [
+        Tool(
+            name = 'Email DB',
+            func = qa.run,
+            description=('useful to answer questions about emails and messages')
+        )
+    ]
+
+    agent = initialize_agent(
+        agent = 'chat-conversational-react-description',
+        tools = tools,
+        llm = llm,
+        verbose = True,
+        max_iterations = 5,
+        early_stopping_method = 'generate',
+        memory = conversational_memory
+    )
+
+    class InteractiveShell(cmd.Cmd):
+        intro = 'Welcome to the Gmail Chat shell. Type help or ? to list commands.\n'
+        prompt = '(Gmail Chat) '
+
+        def do_quit(self, arg):
+            "Exit the shell."
+            print('Goodbye.')
+            return True
+        
+        def emptyline(self):
+            pass
+
+        def default(self, arg):
+            "Ask a question."
+            result = agent.run(arg)
+            print(f'\n{result}')
+
+    InteractiveShell().cmdloop()
 
 def main():
     if len(sys.argv) < 2:
@@ -225,6 +278,8 @@ def main():
         if len(sys.argv) < 3:
             sys.exit('Usage: gmail_chat ask <query>')
         ask(sys.argv[2])
+    elif sys.argv[1] == 'chat':
+        chat()
 
 if __name__ == '__main__':
     main()
