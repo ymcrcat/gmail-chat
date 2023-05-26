@@ -4,7 +4,9 @@ import os.path
 import base64
 import pickle
 import cmd
+import re
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.api_core.exceptions import BadRequest
@@ -23,7 +25,7 @@ from langchain.agents import Tool, initialize_agent
 
 MODEL_NAME = "text-embedding-ada-002" # Name of the model used to generate text embeddings
 # MAX_TOKENS = 8191 # Maximum number of tokens allowed by the model
-MAX_TOKENS = 2048
+MAX_TOKENS = 3000 # stay below the 4097 token limit for GPT-3
 INDEX_NAME = "email-index"
 TEXT_EMBEDDINGS_DIM = 1536 # Dimension of text embeddings
 METRIC = "cosine"
@@ -90,6 +92,17 @@ def get_gmail_credentials():
             pickle.dump(creds, token)
     return creds
 
+def parse_date(date_string):
+    try:
+        date = parser.parse(date_string)
+    except ValueError:
+        try:
+            cleaned_date_string = re.sub(r'\.\d+_\d+$', '', date_string)
+            date = parser.parse(cleaned_date_string)
+        except ValueError:
+            date = None
+    return date
+
 # Function to decode the message part
 def decode_part(part):
     data = part['body']['data']
@@ -104,67 +117,88 @@ def find_part(parts, mime_type):
             return part
     return None
 
+message_count = 0
+
 def index_gmail():
     pinecone_index = pinecone_setup()
     creds = get_gmail_credentials()
     embed = OpenAIEmbeddings(model=MODEL_NAME, openai_api_key=os.getenv('OPENAI_API_KEY'))
 
     try:
-        service = build('gmail', 'v1', credentials=creds)
+        def process_email(msg):
+            """Process email data and add to Pinecone index"""
+            global message_count
+            email_data = msg['payload']['headers']
 
-        # Call the Gmail API to fetch INBOX
-        results = service.users().messages().list(userId='me',labelIds = ['INBOX']).execute()
-        messages = results.get('messages',[])
-
-        if not messages:
-            print('No messages found.')
-        else:
-            pbar = tqdm(total=len(messages), ncols=70, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}')
-            message_count = 0
-            for message in messages:
-                msg = service.users().messages().get(userId='me', id=message['id']).execute() # fetch the message using API
-                email_data = msg['payload']['headers'] # Get data from 'payload' part of dictionary
-
-                subject = ''
-                for values in email_data: 
-                    name = values['name']
-                    if name == 'From':
-                        from_name = values['value']
-                    if name == 'Subject':
-                        subject = values['value']
-                    if name == 'Date':
-                        date_value = values['value']
-                        datetime_object = parser.parse(date_value) # Parsing date from string to datetime
-                
-                try:
-                    data = None
-                    payload = msg['payload']
-                    if 'parts' in payload and len(payload['parts']) > 0:
-                        part = find_part(payload['parts'], 'text/plain')
+            subject = ''
+            to_name = ''
+            for values in email_data: 
+                name = values['name']
+                if name == 'From':
+                    from_name = values['value']
+                if name == 'To':
+                    to_name = values['value']
+                if name == 'Subject':
+                    subject = values['value']
+                if name == 'Date':
+                    date_value = values['value']
+                    datetime_object = parse_date(date_value)
+            
+            try:
+                data = None
+                payload = msg['payload']
+                if 'parts' in payload and len(payload['parts']) > 0:
+                    part = find_part(payload['parts'], 'text/plain')
+                    if part:
+                        data = decode_part(part)
+                    else:
+                        part = find_part(payload['parts'], 'text/html')
                         if part:
                             data = decode_part(part)
-                        else:
-                            part = find_part(payload['parts'], 'text/html')
-                            if part:
-                                data = decode_part(part)
-                    if not data:
-                        raise ValueError(f"Could not find body in message {message['id']}")
-          
-                    content = 'From: ' + from_name + '\n' + 'Date: ' + str(datetime_object) + '\n' + 'Subject: ' + subject + '\n' + data
-                    
-                    # Embed email data an add to Pinecone index
-                    chunks = chunk_text(content)
-                    embeds = embed.embed_documents(chunks)
-                    ids = [message['id'] + '-' + str(i) for i in range(len(chunks))]
-                    pinecone_index.upsert(vectors=zip(ids, embeds, [{'id': message['id'], 'text': chunks[i]} for i in range(len(chunks))]))
+                if not data:
+                    raise ValueError(f"Could not find body in message {msg['id']}")
+        
+                content = f"From: {from_name}\n" \
+                  f"To: {to_name}\n" \
+                  f"Date: {datetime_object}\n" \
+                  f"Subject: {subject}\n" \
+                  f"{data}"
+                
+                # Embed email data an add to Pinecone index
+                chunks = chunk_text(content)
+                embeds = embed.embed_documents(chunks)
+                ids = [msg['id'] + '-' + str(i) for i in range(len(chunks))]
+                pinecone_index.upsert(vectors=zip(ids, embeds, [{'id': msg['id'], 'text': chunks[i]} for i in range(len(chunks))]))
 
-                except BadRequest as e:
-                    print(f"\nError while adding email {message['id']} to Pinecone: {e}")
-                except ValueError as e:
-                    print(f"\nError while adding email {message['id']} to Pinecone: {e}")
-                finally:
-                    pbar.update(1)
-                    message_count += 1
+            except BadRequest as e:
+                print(f"\nError while adding email {msg['id']} to Pinecone: {e}")
+            except ValueError as e:
+                print(f"\nError while adding email {msg['id']} to Pinecone: {e}")
+            finally:
+                message_count += 1
+
+        # Define a function to get all messages recursively
+        def get_all_emails(gmail, query, page_token=None):
+            try:
+                result = gmail.users().messages().list(q=query, userId='me', pageToken=page_token).execute()
+                messages = result.get('messages', [])
+                next_page = result.get('nextPageToken', None)
+                if next_page:
+                    messages.extend(get_all_emails(gmail, query, next_page))
+                return messages
+            except HttpError as error:
+                print(f"An error occurred: {error}")
+                return []
+
+        gmail = build('gmail', 'v1', credentials=creds)
+        # A query to retrieve all emails, including archived ones
+        query = "in:all"
+        emails = get_all_emails(gmail, query)
+
+        # Process and print the result
+        for email in tqdm(emails, desc='Processing emails', file=sys.stdout):
+            msg = gmail.users().messages().get(id=email.get('id'), userId='me', format='full').execute()
+            process_email(msg)
                     
         print(f"Successfully added {message_count} emails to Pinecone.")
         print(pinecone_index.describe_index_stats())
@@ -193,11 +227,6 @@ def ask(query):
     llm = ChatOpenAI(openai_api_key=openai_api_key, 
                      model_name=GPT_MODEL,
                      temperature=0.0)
-
-    # Find relevant emails
-    # embed_query = embed.embed_documents(chunk_text(query))
-    # response = pinecone_index.query(queries=embed_query, top_k=3)
-    # print (response)
 
     # Answer question using LLM and email content
     text_field = "text"
@@ -259,8 +288,11 @@ def chat():
 
         def default(self, arg):
             "Ask a question."
-            result = agent.run(arg)
-            print(f'\n{result}')
+            try:
+                result = agent.run(arg)
+                print(f'\n{result}')
+            except Exception as e:
+                print(e)
 
     InteractiveShell().cmdloop()
 
