@@ -12,21 +12,29 @@ from langchain.embeddings.openai import OpenAIEmbeddings
 import pinecone
 from tqdm import tqdm
 import tiktoken
-from langchain.text_splitter import CharacterTextSplitter
+from langchain.text_splitter import CharacterTextSplitter, RecursiveCharacterTextSplitter
+from langchain.vectorstores import Pinecone
+from langchain.chat_models import ChatOpenAI
+from langchain.chains.conversation.memory import ConversationBufferWindowMemory
+from langchain.chains import RetrievalQA
 
 
 MODEL_NAME = "text-embedding-ada-002" # Name of the model used to generate text embeddings
-MAX_TOKENS = 8191 # Maximum number of tokens allowed by the model
+# MAX_TOKENS = 8191 # Maximum number of tokens allowed by the model
+MAX_TOKENS = 2048
 INDEX_NAME = "email-index"
 TEXT_EMBEDDINGS_DIM = 1536 # Dimension of text embeddings
-METRIC="cosine"
+METRIC = "cosine"
+GPT_MODEL = 'gpt-3.5-turbo'
 
 def chunk_text(text):
     # Initialize the tokenizer
-    tokenizer = tiktoken.encoding_for_model('gpt-3.5-turbo')
+    tokenizer = tiktoken.encoding_for_model(GPT_MODEL)
     
     # Initialize the text splitter
-    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(tokenizer.name)
+    # text_splitter = CharacterTextSplitter.from_tiktoken_encoder(tokenizer.name)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=MAX_TOKENS,
+                                                   chunk_overlap=0)
 
     # Split the tokens into chunks of 8191 tokens
     chunks = text_splitter.split_text(text)
@@ -49,11 +57,9 @@ def pinecone_setup():
 
     pinecone_init()
     if INDEX_NAME not in pinecone.list_indexes():
-        print(f'Creating Pinecone index {INDEX_NAME}')
-        pinecone.create_index(name=INDEX_NAME, metric=METRIC, dimension=TEXT_EMBEDDINGS_DIM)
-        pinecone_init()
+        raise ValueError(f'Pinecone index {INDEX_NAME} does not exist', INDEX_NAME)
     else:
-        print(f'Pinecone index {INDEX_NAME} already exists', INDEX_NAME)
+        print(f'Pinecone index {INDEX_NAME} exists', INDEX_NAME)
     
     pinecone_index = pinecone.Index(INDEX_NAME)        
     print(pinecone_index.describe_index_stats())
@@ -109,7 +115,7 @@ def index_gmail():
         messages = results.get('messages',[])
 
         if not messages:
-            print('No new messages.')
+            print('No messages found.')
         else:
             pbar = tqdm(total=len(messages), ncols=70, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}')
             message_count = 0
@@ -148,7 +154,7 @@ def index_gmail():
                     chunks = chunk_text(content)
                     embeds = embed.embed_documents(chunks)
                     ids = [message['id'] + '-' + str(i) for i in range(len(chunks))]
-                    pinecone_index.upsert(vectors=zip(ids, embeds, [{'id': message['id']} for i in range(len(chunks))]))
+                    pinecone_index.upsert(vectors=zip(ids, embeds, [{'id': message['id'], 'text': chunks[i]} for i in range(len(chunks))]))
 
                 except BadRequest as e:
                     print(f"\nError while adding email {message['id']} to Pinecone: {e}")
@@ -158,7 +164,8 @@ def index_gmail():
                     pbar.update(1)
                     message_count += 1
                     
-        print(f"Successfully added {message_count} emails to Pinecone")
+        print(f"Successfully added {message_count} emails to Pinecone.")
+        print(pinecone_index.describe_index_stats())
 
     except Exception as error:
         print(f'An error occurred: {error}')
@@ -174,12 +181,35 @@ def delete_index():
     pinecone.delete_index(INDEX_NAME)
     print(f"Successfully deleted index {INDEX_NAME}")
 
-def search(query):
+def ask(query):
+    openai_api_key=os.getenv('OPENAI_API_KEY')
+    if openai_api_key is None:
+        raise ValueError("OPENAI_API_KEY environment variable is not set")
     pinecone_index = pinecone_setup()
-    embed = OpenAIEmbeddings(model=MODEL_NAME, openai_api_key=os.getenv('OPENAI_API_KEY'))
-    embed_query = embed.embed_documents(chunk_text(query))
-    response = pinecone_index.query(queries=embed_query, top_k=5)
-    print (response)
+
+    embed = OpenAIEmbeddings(model=MODEL_NAME, openai_api_key=openai_api_key)
+    llm = ChatOpenAI(openai_api_key=openai_api_key, 
+                     model_name=GPT_MODEL,
+                     temperature=0.0)
+    conversational_memory = ConversationBufferWindowMemory(
+        memory_key='chat_history',
+        k = 5,
+        return_messages=True)
+
+    # embed_query = embed.embed_documents(chunk_text(query))
+    # response = pinecone_index.query(queries=embed_query, top_k=3)
+    # print (response)
+
+    text_field = "text"
+    vectorstore = Pinecone(pinecone_index, embed.embed_query, text_field)
+    # results = vectorstore.similarity_search(query, k=5)
+    # print(results)
+    
+    qa = RetrievalQA.from_chain_type(llm=llm, 
+                                     chain_type="refine",
+                                     retriever=vectorstore.as_retriever())
+    result = qa.run(query)
+    print(f'\n{result}')
 
 def main():
     if len(sys.argv) < 2:
@@ -191,10 +221,10 @@ def main():
         index_gmail()
     if sys.argv[1] == 'delete':
         delete_index()
-    elif sys.argv[1] == 'search':
+    elif sys.argv[1] == 'ask':
         if len(sys.argv) < 3:
-            sys.exit('Usage: gmail_chat search <query>')
-        search(sys.argv[2])
+            sys.exit('Usage: gmail_chat ask <query>')
+        ask(sys.argv[2])
 
 if __name__ == '__main__':
     main()
