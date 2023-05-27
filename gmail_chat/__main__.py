@@ -50,10 +50,10 @@ def chunk_text(text):
 def pinecone_init():
     pinecone_environment = os.getenv('PINECONE_ENVIRONMENT')
     if not pinecone_environment:
-        raise ValueError("Pinecone environment must be provided in environment variable PINECONE_ENVIRONMENT")
+        sys.exit("Pinecone environment must be provided in environment variable PINECONE_ENVIRONMENT")
     pinecone_api_key = os.getenv('PINECONE_API_KEY')
     if not pinecone_api_key:
-        raise ValueError("Pinecone API key must be provided in environment variable PINECONE_API_KEY")
+        sys.exit("Pinecone API key must be provided in environment variable PINECONE_API_KEY")
 
     pinecone.init(api_key=pinecone_api_key, pinecone_environment=pinecone_environment)
 
@@ -126,7 +126,10 @@ message_count = 0 # Global variable to keep track of number of messages processe
 def index_gmail():
     pinecone_index = pinecone_setup()
     creds = get_gmail_credentials()
-    embed = OpenAIEmbeddings(model=MODEL_NAME, openai_api_key=os.getenv('OPENAI_API_KEY'))
+    openai_api_key=os.getenv('OPENAI_API_KEY')
+    if not openai_api_key:
+        sys.exit("OpenAI API key must be provided in environment variable OPENAI_API_KEY")
+    embed = OpenAIEmbeddings(model=MODEL_NAME, openai_api_key=openai_api_key)
 
     try:
         def process_email(msg):
@@ -227,7 +230,7 @@ def delete_index():
 
 def ask(query):
     openai_api_key=os.getenv('OPENAI_API_KEY')
-    if openai_api_key is None:
+    if not openai_api_key:
         raise ValueError("OPENAI_API_KEY environment variable is not set")
     pinecone_index = pinecone_setup()
 
@@ -248,10 +251,9 @@ def ask(query):
 def chat():
     openai_api_key=os.getenv('OPENAI_API_KEY')
     if openai_api_key is None:
-        raise ValueError("OPENAI_API_KEY environment variable is not set")
-    pinecone_index = pinecone_setup()
-
+        sys.exit("OPENAI_API_KEY environment variable is not set")
     embed = OpenAIEmbeddings(model=MODEL_NAME, openai_api_key=openai_api_key)
+    pinecone_index = pinecone_setup()
     llm = ChatOpenAI(openai_api_key=openai_api_key, 
                      model_name=GPT_MODEL,
                      temperature=0.0)
