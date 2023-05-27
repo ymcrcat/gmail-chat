@@ -25,11 +25,12 @@ from langchain.agents import Tool, initialize_agent
 
 MODEL_NAME = "text-embedding-ada-002" # Name of the model used to generate text embeddings
 # MAX_TOKENS = 8191 # Maximum number of tokens allowed by the model
-MAX_TOKENS = 1500 # stay below the 4096 token limit for GPT-3
+MAX_TOKENS = 4000 # stay below the 4096 token limit for GPT-3
+CHUNK_OVERLAP = 100 # Number of tokens to overlap between chunks
 INDEX_NAME = "email-index"
 TEXT_EMBEDDINGS_DIM = 1536 # Dimension of text embeddings
 METRIC = "cosine"
-GPT_MODEL = 'gpt-3.5-turbo'
+GPT_MODEL = 'gpt-4'
 
 def chunk_text(text):
     # Initialize the tokenizer
@@ -38,7 +39,7 @@ def chunk_text(text):
     # Initialize the text splitter
     # text_splitter = CharacterTextSplitter.from_tiktoken_encoder(tokenizer.name)
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=MAX_TOKENS,
-                                                   chunk_overlap=100)
+                                                   chunk_overlap=CHUNK_OVERLAP)
 
     # Split the tokens into chunks of 8191 tokens
     chunks = text_splitter.split_text(text)
@@ -159,7 +160,7 @@ def index_gmail():
                         if part:
                             data = decode_part(part)
                 if not data:
-                    raise ValueError(f"Could not find body in message {msg['id']}")
+                    raise ValueError(f"Couldn't find body in message {msg['id']}")
         
                 chunk_prefix = f"From: {from_name}\n" \
                   f"To: {to_name}\n" \
@@ -175,7 +176,7 @@ def index_gmail():
                 message_count += 1
 
             except Exception as e:
-                print(f"\nError while adding email {msg['id']} to Pinecone: {e}")
+                print(f"\nError while processing email {msg['id']}: {e}")
 
         # Define a function to get all messages recursively
         def get_all_emails(gmail, query):
@@ -261,7 +262,7 @@ def chat():
     text_field = "text"
     vectorstore = Pinecone(pinecone_index, embed.embed_query, text_field)
     qa = RetrievalQA.from_chain_type(llm=llm, 
-                                     chain_type="stuff",
+                                     chain_type="refine",
                                      retriever=vectorstore.as_retriever())
 
     tools = [
@@ -305,7 +306,11 @@ def chat():
     InteractiveShell().cmdloop()
 
 def usage():
-    sys.exit('Usage: gmail_chat index | ask <query> | chat | create | delete')
+    sys.exit("""
+    OPENAI_API_KEY, PINECONE_ENVIRONMENT, and PINECONE_API_KEY environment variables must be set.
+    
+    Usage: gmail_chat index | ask <query> | chat | create | delete
+    """)
 
 def main():
     if len(sys.argv) < 2:
