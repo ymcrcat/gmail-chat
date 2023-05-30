@@ -25,7 +25,7 @@ from langchain.agents import Tool, initialize_agent
 
 MODEL_NAME = "text-embedding-ada-002" # Name of the model used to generate text embeddings
 # MAX_TOKENS = 8191 # Maximum number of tokens allowed by the model
-MAX_TOKENS = 4000 # stay below the 4096 token limit for GPT-3
+MAX_TOKENS = 3800 # stay below the 4096 token limit for GPT-3
 CHUNK_OVERLAP = 100 # Number of tokens to overlap between chunks
 INDEX_NAME = "email-index"
 TEXT_EMBEDDINGS_DIM = 1536 # Dimension of text embeddings
