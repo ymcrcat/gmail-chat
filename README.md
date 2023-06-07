@@ -1,3 +1,5 @@
+![gmail-chat logo](assets/logo.png)
+
 # gmail-chat
 
 `gmail-chat` enables to index the emails in your Gmail account, create vector embeddings for each, and store them in Pinecone. Then, you can ask questions about your emails in natural language, using conversational models.
