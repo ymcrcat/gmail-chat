@@ -11,64 +11,52 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.api_core.exceptions import BadRequest
 import dateutil.parser as parser
-from langchain.embeddings.openai import OpenAIEmbeddings
-import pinecone
 from tqdm import tqdm
-import tiktoken
+from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Pinecone
+from langchain.vectorstores import Qdrant
 from langchain.chat_models import ChatOpenAI
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.retrievers.self_query.base import SelfQueryRetriever
+from langchain.chains.query_constructor.base import AttributeInfo
 from langchain.chains.conversation.memory import ConversationBufferWindowMemory
 from langchain.chains import RetrievalQA
 from langchain.agents import Tool, initialize_agent
 
-
+MAX_MESSAGES = 100
 MODEL_NAME = "text-embedding-ada-002" # Name of the model used to generate text embeddings
-# MAX_TOKENS = 8191 # Maximum number of tokens allowed by the model
-MAX_TOKENS = 3800 # stay below the 4096 token limit for GPT-3
-CHUNK_OVERLAP = 100 # Number of tokens to overlap between chunks
-INDEX_NAME = "email-index"
-TEXT_EMBEDDINGS_DIM = 1536 # Dimension of text embeddings
+MAX_TOKENS = 120000 # Maximum number of tokens per chunk
+CHUNK_OVERLAP = 0 # Overlap between chunks
+COLLECTION_NAME = "email-index"
 METRIC = "cosine"
-GPT_MODEL = 'gpt-4'
+GPT_MODEL = 'gpt-4-1106-preview'
+
+metadata_field_info = [
+    AttributeInfo(name='id', description='Message ID', type='string', is_primary_key=True),
+    AttributeInfo(name='subject', description='Email subject', type='string', is_primary_key=False),
+    AttributeInfo(name='from', description='Email sender', type='string', is_primary_key=False),
+    AttributeInfo(name='to', description='Email recipient', type='string', is_primary_key=False),
+    AttributeInfo(name='date', description='Email receipt date and time', type='string', is_primary_key=False)
+]
 
 def chunk_text(text):
-    # Initialize the tokenizer
-    tokenizer = tiktoken.encoding_for_model(GPT_MODEL)
-    
     # Initialize the text splitter
-    # text_splitter = CharacterTextSplitter.from_tiktoken_encoder(tokenizer.name)
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=MAX_TOKENS,
                                                    chunk_overlap=CHUNK_OVERLAP)
 
-    # Split the tokens into chunks of 8191 tokens
+    # Split the tokens into chunks of MAX_TOKENS tokens
     chunks = text_splitter.split_text(text)
 
     # Return the chunks
     return chunks
 
-def pinecone_init():
-    pinecone_environment = os.getenv('PINECONE_ENVIRONMENT')
-    if not pinecone_environment:
-        sys.exit("Pinecone environment must be provided in environment variable PINECONE_ENVIRONMENT")
-    pinecone_api_key = os.getenv('PINECONE_API_KEY')
-    if not pinecone_api_key:
-        sys.exit("Pinecone API key must be provided in environment variable PINECONE_API_KEY")
-
-    pinecone.init(api_key=pinecone_api_key, pinecone_environment=pinecone_environment)
-
-def pinecone_setup():
-    """Setup Pinecone environment and create index"""    
-
-    pinecone_init()
-    if INDEX_NAME not in pinecone.list_indexes():
-        raise ValueError(f'Pinecone index {INDEX_NAME} does not exist', INDEX_NAME)
-    else:
-        print(f'Pinecone index {INDEX_NAME} exists', INDEX_NAME)
+def vectorstore_setup():
+    """Load stored email index from file"""
     
-    pinecone_index = pinecone.Index(INDEX_NAME)        
-    print(pinecone_index.describe_index_stats())
-    return pinecone_index
+    docs = pickle.load(open('email_index.pkl', 'rb'))
+    vectorstore = Qdrant.from_documents(docs, embedding=OpenAIEmbeddings(), location=":memory:", collection_name=COLLECTION_NAME)
+    print("Vectorstore created from emails")
+    return vectorstore
 
 def get_gmail_credentials():
     """Get Gmail credentials from credentials.json file or token.pickle file"""
@@ -124,16 +112,19 @@ def find_part(parts, mime_type):
 message_count = 0 # Global variable to keep track of number of messages processed
 
 def index_gmail():
-    pinecone_index = pinecone_setup()
+    vectorstore_path = os.getenv('VECTORSTORE_PATH')
+    if not vectorstore_path:
+        sys.exit("VECTORSTORE_PATH environment variable is not set")
+    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+    if not OPENAI_API_KEY:
+        sys.exit("OPENAI_API_KEY environment variable is not set")
+    
     creds = get_gmail_credentials()
-    openai_api_key=os.getenv('OPENAI_API_KEY')
-    if not openai_api_key:
-        sys.exit("OpenAI API key must be provided in environment variable OPENAI_API_KEY")
-    embed = OpenAIEmbeddings(model=MODEL_NAME, openai_api_key=openai_api_key)
+    docs = []
 
     try:
         def process_email(msg):
-            """Process email data and add to Pinecone index"""
+            """Process email data and add to index"""
             global message_count
             email_data = msg['payload']['headers']
 
@@ -164,18 +155,14 @@ def index_gmail():
                             data = decode_part(part)
                 if not data:
                     raise ValueError(f"Couldn't find body in message {msg['id']}")
-        
-                chunk_prefix = f"From: {from_name}\n" \
-                  f"To: {to_name}\n" \
-                  f"Date: {datetime_object}\n" \
-                  f"Subject: {subject}\n"
                 
-                # Embed email data an add to Pinecone index
-                chunks = [f'{chunk_prefix}{chunk}' for chunk in chunk_text(data)]
-                embeds = embed.embed_documents(chunks)
-                ids = [msg['id'] + '-' + str(i) for i in range(len(chunks))]
-                pinecone_index.upsert(vectors=zip(ids, embeds, [{'id': msg['id'], 'text': chunks[i]} for i in range(len(chunks))]))
-
+                # Embed email data an add to index
+                chunks = chunk_text(data)
+                docs.extend([Document(page_content=chunk,
+                                      metadata={'id': msg['id'], 'subject': subject, 
+                                                'from': from_name, 'to': to_name, 
+                                                'date': datetime_object}) for chunk in chunks])
+                pickle.dump(docs, open('email_index.pkl', 'wb'))
                 message_count += 1
 
             except Exception as e:
@@ -190,11 +177,11 @@ def index_gmail():
                 try:
                     result = gmail.users().messages().list(q=query, 
                                                         userId='me', 
-                                                        maxResults=500, 
+                                                        maxResults=MAX_MESSAGES, 
                                                         pageToken=page_token).execute()
                     messages.extend( result.get('messages', []) )
                     page_token = result.get('nextPageToken', None)
-                    if not page_token:
+                    if (not page_token) or len(messages) >= MAX_MESSAGES:
                         break
                 except HttpError as error:
                     print(f"An error occurred: {error}")
@@ -210,38 +197,26 @@ def index_gmail():
         for email in tqdm(emails, desc='Processing emails', file=sys.stdout):
             msg = gmail.users().messages().get(id=email.get('id'), userId='me', format='full').execute()
             process_email(msg)
-                    
-        print(f"Successfully added {message_count} emails to Pinecone.")
-        print(pinecone_index.describe_index_stats())
+        
+        pickle.dump(docs, open('email_index.pkl', 'wb'))
+        print(f"Successfully added {message_count} emails to index.")
 
     except Exception as error:
         print(f'An error occurred: {error}')
         raise error
 
-def create_index():
-    pinecone_init()
-    pinecone.create_index(name=INDEX_NAME, metric=METRIC, dimension=TEXT_EMBEDDINGS_DIM)
-    print(f"Successfully created index {INDEX_NAME}")
-
-def delete_index():
-    pinecone_init()
-    pinecone.delete_index(INDEX_NAME)
-    print(f"Successfully deleted index {INDEX_NAME}")
-
 def ask(query):
     openai_api_key=os.getenv('OPENAI_API_KEY')
     if not openai_api_key:
         raise ValueError("OPENAI_API_KEY environment variable is not set")
-    pinecone_index = pinecone_setup()
+    vectorstore = vectorstore_setup()
 
-    embed = OpenAIEmbeddings(model=MODEL_NAME, openai_api_key=openai_api_key)
     llm = ChatOpenAI(openai_api_key=openai_api_key, 
                      model_name=GPT_MODEL,
                      temperature=0.0)
+                                            
 
     # Answer question using LLM and email content
-    text_field = "text" 
-    vectorstore = Pinecone(pinecone_index, embed.embed_query, text_field)    
     qa = RetrievalQA.from_chain_type(llm=llm, 
                                      chain_type="stuff",
                                      retriever=vectorstore.as_retriever())
@@ -252,8 +227,7 @@ def chat():
     openai_api_key=os.getenv('OPENAI_API_KEY')
     if openai_api_key is None:
         sys.exit("OPENAI_API_KEY environment variable is not set")
-    embed = OpenAIEmbeddings(model=MODEL_NAME, openai_api_key=openai_api_key)
-    pinecone_index = pinecone_setup()
+    vectorstore = vectorstore_setup()
     llm = ChatOpenAI(openai_api_key=openai_api_key, 
                      model_name=GPT_MODEL,
                      temperature=0.0)
@@ -261,15 +235,14 @@ def chat():
         memory_key='chat_history',
         k = 10,
         return_messages=True)
-    text_field = "text"
-    vectorstore = Pinecone(pinecone_index, embed.embed_query, text_field)
+    
     qa = RetrievalQA.from_chain_type(llm=llm, 
                                      chain_type="refine",
                                      retriever=vectorstore.as_retriever())
 
     tools = [
         Tool(
-            name = 'Email DB',
+            name = 'Email Index',
             func = qa.run,
             description=('useful to answer questions about emails and messages')
         )
@@ -309,21 +282,17 @@ def chat():
 
 def usage():
     sys.exit("""
-    OPENAI_API_KEY, PINECONE_ENVIRONMENT, and PINECONE_API_KEY environment variables must be set.
+    OPENAI_API_KEY, and VECTORSTORE_PATH environment variables must be set.
     
-    Usage: gmail_chat index | ask <query> | chat | create | delete
+    Usage: gmail_chat index | ask <query> | chat
     """)
 
 def main():
     if len(sys.argv) < 2:
         usage()
 
-    if sys.argv[1] == 'create':
-        create_index()
-    elif sys.argv[1] == 'index':
+    if sys.argv[1] == 'index':
         index_gmail()
-    elif sys.argv[1] == 'delete':
-        delete_index()
     elif sys.argv[1] == 'ask':
         if len(sys.argv) < 3:
             usage()

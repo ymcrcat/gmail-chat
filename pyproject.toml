@@ -1,21 +1,23 @@
 [tool.poetry]
 name = "gmail-chat"
-version = "0.1.0"
+version = "0.1.1"
 description = ""
 authors = ["Yan Michalevsky <yanm2@cs.stanford.edu>"]
 readme = "README.md"
 packages = [{include = "gmail_chat"}]
 
 [tool.poetry.dependencies]
-python = "^3.11"
+python = ">=3.11,<3.13"
 google-api-python-client = "^2.0.0"
 google-auth-httplib2 = "^0.1.0"
 google-auth-oauthlib = "^0.5.0"
-pinecone-client = "^2.2.0"
 tqdm = "^4.62.3"
 langchain = "^0.0.180"
 openai = "^0.27.7"
 tiktoken = "^0.4.0"
+lark = "^1.1.8"
+python-dateutil = "^2.8.2"
+qdrant-client = "^1.6.9"
 
 [build-system]
 requires = ["poetry-core"]
